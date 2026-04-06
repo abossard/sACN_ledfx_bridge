@@ -1,6 +1,22 @@
 # sACN ledfx Bridge
 
+> **⚠️ Disclaimer:** This fork is shamelessly vibecoded on top of [8-Lambda-8's original](https://github.com/8-Lambda-8/sACN_ledfx_bridge). It might only work on my machine 😉
+
 Control LedFx scenes, playlists, brightness, and blackout via sACN/DMX — designed for use with QLC+.
+
+## What's different in this fork?
+
+Compared to the [original by 8-Lambda-8](https://github.com/8-Lambda-8/sACN_ledfx_bridge), this fork adds:
+
+- **Multi-channel DMX control** — the original used a single DMX channel for scene selection; this fork supports independent channels for scene, playlist, brightness, blackout, and color
+- **Playlist support** — start/stop LedFx playlists via a dedicated DMX channel
+- **Brightness control** — set global LedFx brightness (0–255 → 0%–100%) via DMX
+- **Blackout toggle** — instant blackout via DMX threshold (128–255), restores previous brightness on release
+- **Color override channel** — force a color on all virtuals via DMX, with a configurable color palette
+- **QLC+ fixture generator** — export a QLC+ fixture definition XML directly from the TUI (press `e`), auto-installs to the correct OS-specific directory
+- **Debounced brightness updates** — 50ms debounce to avoid flooding the LedFx API
+- **Improved error handling** — non-fatal logging instead of crashing on API errors
+
 
 ## Rewritten in GO
 for old nodejs version go to [nodejs branch](https://github.com/8-Lambda-8/sACN_ledfx_bridge/tree/nodejs)
@@ -51,7 +67,8 @@ Each function is mapped to its own configurable DMX channel (set channel to `0` 
 Scene and playlist IDs can be loaded directly from the LedFx API via the TUI.
 
 ## New TUI
-![image](https://github.com/user-attachments/assets/ce494616-2060-41cf-95fc-bc634cd4999f)
+
+![alt text](screenshot.png)
 
 ### Example configuration for QLC+:
 - QLC+, LedFx and sACN_ledfx_bridge running on same machine
@@ -71,10 +88,6 @@ Scene and playlist IDs can be loaded directly from the LedFx API via the TUI.
   - LedFx Host: http://127.0.0.1:8888 (Default)
   - Scenes: go into scene submenu and select "get scenes from LedFx" to load all scenes
   - Playlists: go into playlist submenu and select "get playlists from LedFx" to load all playlists
-
-### Backward Compatibility
-
-Old config files using the legacy `"channel"` field are automatically migrated to the new `"channels"` format on load.
 
 
 ![image](https://github.com/user-attachments/assets/27a1b6d9-208f-4606-9000-ac30cd6a63e1)

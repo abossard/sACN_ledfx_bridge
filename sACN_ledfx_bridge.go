@@ -56,7 +56,6 @@ type Channels struct {
 
 type Config struct {
 	Universe   uint64            `json:"sAcnUniverse"`
-	Channel    uint64            `json:"channel,omitempty"` // legacy, migrated to Channels.Scene
 	Channels   Channels          `json:"channels"`
 	Scenes     []string          `json:"scenes"`
 	Playlists  []string          `json:"playlists"`
@@ -250,11 +249,6 @@ func main() {
 		err = json.Unmarshal(file, &configData)
 		if err != nil {
 			log.Fatal(err)
-		}
-		// Migrate legacy "channel" field to "channels.scene"
-		if configData.Channel != 0 && configData.Channels.Scene == 0 {
-			configData.Channels.Scene = configData.Channel
-			configData.Channel = 0
 		}
 		configFromFile = true
 	}

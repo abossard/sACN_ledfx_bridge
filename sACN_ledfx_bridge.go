@@ -1,16 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"html"
 	"io"
 	"io/fs"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -27,60 +31,152 @@ import (
 
 var p *tea.Program
 
+// Setting indices for TUI navigation
+const (
+	settUniverse = iota
+	settSceneCh
+	settPlaylistCh
+	settBrightnessCh
+	settBlackoutCh
+	settHost
+	settScenes
+	settPlaylists
+	settSave
+)
+
+type Channels struct {
+	Scene      uint64 `json:"scene"`
+	Playlist   uint64 `json:"playlist"`
+	Brightness uint64 `json:"brightness"`
+	Blackout   uint64 `json:"blackout"`
+}
+
 type Config struct {
 	Universe   uint64   `json:"sAcnUniverse"`
-	Channel    uint64   `json:"channel"`
+	Channel    uint64   `json:"channel,omitempty"` // legacy, migrated to Channels.Scene
+	Channels   Channels `json:"channels"`
 	Scenes     []string `json:"scenes"`
+	Playlists  []string `json:"playlists"`
 	LedFx_host string   `json:"ledfx_host"`
 }
 
+func ledfxRequest(method, path string, body interface{}) error {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequest(method, configData.LedFx_host+path, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
+}
+
 func activateScene(sceneId string, deactivate bool) {
-	var action = "activate"
+	action := "activate"
 	if deactivate {
+		if ActiveScene == "OFF" {
+			return
+		}
+		sceneId = ActiveScene
 		ActiveScene = "OFF"
 		action = "deactivate"
 	} else {
 		ActiveScene = sceneId
+		if ActivePlaylist != "OFF" {
+			stopPlaylist()
+		}
 	}
-	p.Send(updateSceneMsg(ActiveScene))
+	p.Send(updateStatusMsg{})
 
-	payload := map[string]interface{}{"id": sceneId, "action": action}
-	out, err := json.Marshal(payload)
+	err := ledfxRequest(http.MethodPut, "/api/scenes", map[string]interface{}{
+		"id": sceneId, "action": action,
+	})
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("activateScene error: %v", err)
 	}
+}
 
-	client := &http.Client{}
-	req, err := http.NewRequest(http.MethodPut,
-		configData.LedFx_host+"/api/scenes",
-		strings.NewReader(string(out)),
-	)
-	if err != nil {
-		// handle error
-		log.Fatal(err)
+func activatePlaylist(playlistId string) {
+	if ActiveScene != "OFF" {
+		// Deactivate scene without stopping playlist (we're about to start one)
+		sceneId := ActiveScene
+		ActiveScene = "OFF"
+		_ = ledfxRequest(http.MethodPut, "/api/scenes", map[string]interface{}{
+			"id": sceneId, "action": "deactivate",
+		})
 	}
-	_, err = client.Do(req)
-	if err != nil {
-		// handle error
-		log.Fatal(err)
-	}
+	ActivePlaylist = playlistId
+	p.Send(updateStatusMsg{})
 
+	err := ledfxRequest(http.MethodPut, "/api/playlists", map[string]interface{}{
+		"action": "start", "id": playlistId,
+	})
+	if err != nil {
+		log.Printf("activatePlaylist error: %v", err)
+	}
+}
+
+func stopPlaylist() {
+	ActivePlaylist = "OFF"
+	p.Send(updateStatusMsg{})
+
+	err := ledfxRequest(http.MethodPut, "/api/playlists", map[string]interface{}{
+		"action": "stop",
+	})
+	if err != nil {
+		log.Printf("stopPlaylist error: %v", err)
+	}
+}
+
+func setGlobalBrightness(value float64) {
+	err := ledfxRequest(http.MethodPut, "/api/config", map[string]interface{}{
+		"global_brightness": value,
+	})
+	if err != nil {
+		log.Printf("setGlobalBrightness error: %v", err)
+	}
 }
 
 var ActiveScene = "OFF"
+var ActivePlaylist = "OFF"
+var BlackoutActive = false
+var currentBrightness float64 = 1.0
 
-var channelValue byte = 0
-var lastChannelValue byte = 0
+var sceneChVal byte = 0
+var lastSceneChVal byte = 0
+var playlistChVal byte = 0
+var lastPlaylistChVal byte = 0
+var brightnessChVal byte = 0
+var lastBrightnessChVal byte = 0
+var blackoutChVal byte = 0
+var lastBlackoutChVal byte = 0
+
+var brightnessTimer *time.Timer
 
 var configFromFile bool = false
 
 var configData Config = Config{
-	Universe:   1,
-	Channel:    1,
+	Universe: 1,
+	Channels: Channels{
+		Scene:      1,
+		Playlist:   2,
+		Brightness: 3,
+		Blackout:   4,
+	},
 	Scenes:     []string{},
+	Playlists:  []string{},
 	LedFx_host: "http://127.0.0.1:8888",
 }
 var tempScenes = []string{}
+var tempPlaylists = []string{}
 
 var configFile string
 
@@ -116,6 +212,11 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
+		// Migrate legacy "channel" field to "channels.scene"
+		if configData.Channel != 0 && configData.Channels.Scene == 0 {
+			configData.Channels.Scene = configData.Channel
+			configData.Channel = 0
+		}
 		configFromFile = true
 	}
 
@@ -125,20 +226,75 @@ func main() {
 	}
 
 	recv.SetOnChangeCallback(func(old sacn.DataPacket, newD sacn.DataPacket) {
-		if newD.Universe() == uint16(configData.Universe) {
-			p.Send(recievingMsg(newD.Universe()))
+		if newD.Universe() != uint16(configData.Universe) {
+			return
+		}
+		p.Send(recievingMsg(newD.Universe()))
+		data := newD.Data()
+
+		// Scene channel
+		if configData.Channels.Scene > 0 {
+			sceneChVal = data[configData.Channels.Scene-1]
+			if sceneChVal != lastSceneChVal {
+				lastSceneChVal = sceneChVal
+				if sceneChVal == 0 {
+					activateScene(ActiveScene, true)
+				} else if int(sceneChVal) <= len(configData.Scenes) {
+					activateScene(configData.Scenes[sceneChVal-1], false)
+				}
+			}
 		}
 
-		channelValue = newD.Data()[configData.Channel-1]
+		// Playlist channel
+		if configData.Channels.Playlist > 0 {
+			playlistChVal = data[configData.Channels.Playlist-1]
+			if playlistChVal != lastPlaylistChVal {
+				lastPlaylistChVal = playlistChVal
+				if playlistChVal == 0 {
+					if ActivePlaylist != "OFF" {
+						stopPlaylist()
+					}
+				} else if int(playlistChVal) <= len(configData.Playlists) {
+					activatePlaylist(configData.Playlists[playlistChVal-1])
+				}
+			}
+		}
 
-		if channelValue != lastChannelValue {
-			lastChannelValue = channelValue
+		// Brightness channel (debounced)
+		if configData.Channels.Brightness > 0 {
+			brightnessChVal = data[configData.Channels.Brightness-1]
+			if brightnessChVal != lastBrightnessChVal {
+				lastBrightnessChVal = brightnessChVal
+				brightness := float64(brightnessChVal) / 255.0
+				currentBrightness = brightness
+				p.Send(updateStatusMsg{})
 
-			if channelValue == 0 {
-				activateScene(ActiveScene, true)
-			} else {
-				if channelValue <= byte(len(configData.Scenes)) {
-					activateScene(configData.Scenes[channelValue-1], false)
+				if brightnessTimer != nil {
+					brightnessTimer.Stop()
+				}
+				brightnessTimer = time.AfterFunc(50*time.Millisecond, func() {
+					if !BlackoutActive {
+						setGlobalBrightness(brightness)
+					}
+				})
+			}
+		}
+
+		// Blackout channel (threshold at 128)
+		if configData.Channels.Blackout > 0 {
+			blackoutChVal = data[configData.Channels.Blackout-1]
+			if blackoutChVal != lastBlackoutChVal {
+				lastBlackoutChVal = blackoutChVal
+				wasBlackout := BlackoutActive
+				BlackoutActive = blackoutChVal >= 128
+
+				if BlackoutActive != wasBlackout {
+					p.Send(updateStatusMsg{})
+					if BlackoutActive {
+						setGlobalBrightness(0)
+					} else {
+						setGlobalBrightness(currentBrightness)
+					}
 				}
 			}
 		}
@@ -191,6 +347,171 @@ func loadLedfxScenes() {
 	slices.Sort(tempScenes)
 }
 
+func loadLedfxPlaylists() {
+	var resp *http.Response
+	resp, err := http.Get(
+		configData.LedFx_host + "/api/playlists",
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var apiObj struct {
+		Playlists map[string]struct {
+			Name string `json:"name"`
+		} `json:"playlists"`
+	}
+
+	err = json.Unmarshal(body, &apiObj)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	tempPlaylists = tempPlaylists[:0]
+	for k := range apiObj.Playlists {
+		tempPlaylists = append(tempPlaylists, k)
+	}
+
+	slices.Sort(tempPlaylists)
+}
+
+func prettifyName(slug string) string {
+	parts := strings.Split(slug, "-")
+	for i, p := range parts {
+		if len(p) > 0 {
+			parts[i] = strings.ToUpper(p[:1]) + p[1:]
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+func qlcFixtureDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		return filepath.Join(home, "Library", "Application Support", "QLC+", "Fixtures")
+	case "linux":
+		return filepath.Join(home, ".qlcplus", "Fixtures")
+	case "windows":
+		return filepath.Join(home, "QLC+", "Fixtures")
+	default:
+		return ""
+	}
+}
+
+func buildCapabilities(items []string, label string) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("  <Capability Min=\"0\" Max=\"0\">%s OFF</Capability>\n", label))
+	for i, item := range items {
+		name := html.EscapeString(prettifyName(item))
+		b.WriteString(fmt.Sprintf("  <Capability Min=\"%d\" Max=\"%d\">%s</Capability>\n", i+1, i+1, name))
+	}
+	if len(items) < 255 {
+		b.WriteString(fmt.Sprintf("  <Capability Min=\"%d\" Max=\"255\">No function</Capability>\n", len(items)+1))
+	}
+	return b.String()
+}
+
+func generateQXF() string {
+	var b strings.Builder
+
+	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE FixtureDefinition>
+<FixtureDefinition xmlns="http://www.qlcplus.org/FixtureDefinition">
+ <Creator>
+  <Name>Q Light Controller Plus</Name>
+  <Version>5.0.0</Version>
+  <Author>sACN LedFx Bridge</Author>
+ </Creator>
+ <Manufacturer>LedFx</Manufacturer>
+ <Model>sACN LedFx Bridge</Model>
+ <Type>Other</Type>
+`)
+
+	// Scene Select channel
+	b.WriteString(" <Channel Name=\"Scene Select\">\n")
+	b.WriteString("  <Group Byte=\"0\">Effect</Group>\n")
+	b.WriteString(buildCapabilities(configData.Scenes, "Scene"))
+	b.WriteString(" </Channel>\n")
+
+	// Playlist Select channel
+	b.WriteString(" <Channel Name=\"Playlist Select\">\n")
+	b.WriteString("  <Group Byte=\"0\">Effect</Group>\n")
+	b.WriteString(buildCapabilities(configData.Playlists, "Playlist"))
+	b.WriteString(" </Channel>\n")
+
+	// Brightness channel (uses preset for proper dimmer icon)
+	b.WriteString(" <Channel Name=\"Brightness\" Preset=\"IntensityMasterDimmer\"/>\n")
+
+	// Blackout channel
+	b.WriteString(` <Channel Name="Blackout">
+  <Group Byte="0">Shutter</Group>
+  <Capability Min="0" Max="127" Preset="ShutterOpen">Normal</Capability>
+  <Capability Min="128" Max="255" Preset="ShutterClose">Blackout</Capability>
+ </Channel>
+`)
+
+	// Mode
+	b.WriteString(" <Mode Name=\"4 Channel\">\n")
+	b.WriteString("  <Channel Number=\"0\">Scene Select</Channel>\n")
+	b.WriteString("  <Channel Number=\"1\">Playlist Select</Channel>\n")
+	b.WriteString("  <Channel Number=\"2\">Brightness</Channel>\n")
+	b.WriteString("  <Channel Number=\"3\">Blackout</Channel>\n")
+	b.WriteString(" </Mode>\n")
+
+	// Physical
+	b.WriteString(` <Physical>
+  <Bulb Type="LED" Lumens="0" ColourTemperature="0"/>
+  <Dimensions Weight="0" Width="0" Height="0" Depth="0"/>
+  <Lens Name="Other" DegreesMin="0" DegreesMax="0"/>
+  <Focus Type="Fixed" PanMax="0" TiltMax="0"/>
+  <Technical PowerConsumption="0" DmxConnector="Other"/>
+ </Physical>
+`)
+
+	b.WriteString("</FixtureDefinition>\n")
+	return b.String()
+}
+
+func exportFixture() (string, string) {
+	qxf := generateQXF()
+	filename := "LedFx-sACN-LedFx-Bridge.qxf"
+
+	// Try QLC+ user fixture directory first
+	dir := qlcFixtureDir()
+	if dir != "" {
+		if _, err := os.Stat(dir); err == nil {
+			path := filepath.Join(dir, filename)
+			if err := os.WriteFile(path, []byte(qxf), 0644); err == nil {
+				return path, fmt.Sprintf("Exported to %s — Restart QLC+ to load fixture", path)
+			}
+		}
+		// Directory doesn't exist, try to create it
+		if err := os.MkdirAll(dir, 0755); err == nil {
+			path := filepath.Join(dir, filename)
+			if err := os.WriteFile(path, []byte(qxf), 0644); err == nil {
+				return path, fmt.Sprintf("Exported to %s — Restart QLC+ to load fixture", path)
+			}
+		}
+	}
+
+	// Fallback to current working directory
+	path := filename
+	if err := os.WriteFile(path, []byte(qxf), 0644); err != nil {
+		return "", fmt.Sprintf("Export failed: %v", err)
+	}
+	return path, fmt.Sprintf("Exported to ./%s — Copy to QLC+ Fixtures folder, then restart QLC+", path)
+}
+
 type Styles struct {
 	colorText      lipgloss.Color
 	colorSelected  lipgloss.Color
@@ -222,42 +543,49 @@ type model struct {
 	width        int
 	height       int
 	cursor       int
-	sceneCursor  int
+	subCursor    int
 	settingItems []string
 	textInput    textinput.Model
 	spinner      spinner.Model
 	recieving    bool
 	changed      bool
+	exportMsg    string
 }
 
 var urlRegex = regexp.MustCompile(`(?m)^(?P<protocol>https?):\/\/(?P<host>(?:(?:[a-z0-9\-_]+\b)\.)*\w+\b)(?:\:(?P<port>\d{1,5}))?(?P<path>\/[\/\d\w\.-]*)*(?:\?(?P<query>[^#/]+))?(?:#(?P<fragment>.+))?$`)
 
 func textInputValidatorGen(cursorPos int) textinput.ValidateFunc {
-	if cursorPos < 2 {
-
-		var maxVal uint64 = 512
-		if cursorPos == 0 {
-			maxVal = 65279
-		}
+	if cursorPos == settUniverse {
 		return textinput.ValidateFunc(func(str string) error {
 			i, err := strconv.ParseUint(str, 10, 16)
 			if err != nil {
 				return err
 			}
-			if 1 > i || i > uint64(maxVal) {
+			if 1 > i || i > 65279 {
 				return fmt.Errorf("input out of Range")
 			}
 			return nil
 		})
-	} else {
+	} else if cursorPos >= settSceneCh && cursorPos <= settBlackoutCh {
 		return textinput.ValidateFunc(func(str string) error {
-
+			i, err := strconv.ParseUint(str, 10, 16)
+			if err != nil {
+				return err
+			}
+			if i > 512 {
+				return fmt.Errorf("input out of Range (0-512, 0=disabled)")
+			}
+			return nil
+		})
+	} else if cursorPos == settHost {
+		return textinput.ValidateFunc(func(str string) error {
 			if urlRegex.FindString(str) != "" {
 				return nil
 			}
 			return errors.New("url invalid")
 		})
 	}
+	return nil
 }
 
 func initialModel() model {
@@ -270,13 +598,17 @@ func initialModel() model {
 	sp.Spinner.FPS = time.Second / 4
 
 	return model{
-		styles:       DefaultStyles(),
-		settingItems: []string{"Universe", "Channel", "LedFx Host", "Scenes", "[Save]"},
-		textInput:    ti,
-		spinner:      sp,
-		recieving:    false,
-		changed:      false,
-		sceneCursor:  -1,
+		styles: DefaultStyles(),
+		settingItems: []string{
+			"Universe", "Scene Channel", "Playlist Channel",
+			"Brightness Channel", "Blackout Channel",
+			"LedFx Host", "Scenes", "Playlists", "[Save]",
+		},
+		textInput: ti,
+		spinner:   sp,
+		recieving: false,
+		changed:   false,
+		subCursor: -1,
 	}
 }
 
@@ -288,10 +620,25 @@ func (m model) Init() tea.Cmd {
 	)
 }
 
-type updateSceneMsg string
+type updateStatusMsg struct{}
 type recievingMsg uint
 type timeOutMsg uint
 type errMsg error
+
+func isTextInputSetting(cursor int) bool {
+	return cursor >= settUniverse && cursor <= settHost
+}
+
+func isSubMenuSetting(cursor int) bool {
+	return cursor == settScenes || cursor == settPlaylists
+}
+
+func activeSubList(cursor int) []string {
+	if cursor == settScenes {
+		return tempScenes
+	}
+	return tempPlaylists
+}
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
@@ -307,16 +654,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+c":
 			return m, tea.Quit
 		case "q":
-			if !m.textInput.Focused() && m.sceneCursor < 0 {
+			if !m.textInput.Focused() && m.subCursor < 0 {
 				return m, tea.Quit
 			}
 
+		case "e":
+			if !m.textInput.Focused() && m.subCursor < 0 {
+				_, msg := exportFixture()
+				m.exportMsg = msg
+			}
+
 		case "up", "k", "w":
-			if m.cursor > 0 && !m.textInput.Focused() && m.sceneCursor < 0 {
+			if m.cursor > 0 && !m.textInput.Focused() && m.subCursor < 0 {
 				m.cursor--
-			} else if m.sceneCursor > 0 {
-				m.sceneCursor--
-			} else if (m.cursor == 0 || m.cursor == 1) && m.textInput.Focused() {
+			} else if m.subCursor > 0 {
+				m.subCursor--
+			} else if isTextInputSetting(m.cursor) && m.cursor != settHost && m.textInput.Focused() {
 				i, err := strconv.ParseUint(m.textInput.Value(), 10, 16)
 				if err == nil {
 					m.textInput.SetValue(fmt.Sprint(i + 1))
@@ -324,34 +677,39 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "down", "j", "s":
-			if m.cursor < len(m.settingItems)-1 && !m.textInput.Focused() && m.sceneCursor < 0 {
+			if m.cursor < len(m.settingItems)-1 && !m.textInput.Focused() && m.subCursor < 0 {
 				m.cursor++
-			} else if m.sceneCursor >= 0 && m.sceneCursor < len(tempScenes) {
-				m.sceneCursor++
-			} else if (m.cursor == 0 || m.cursor == 1) && m.textInput.Focused() {
+			} else if m.subCursor >= 0 && m.subCursor < len(activeSubList(m.cursor)) {
+				m.subCursor++
+			} else if isTextInputSetting(m.cursor) && m.cursor != settHost && m.textInput.Focused() {
 				i, err := strconv.ParseUint(m.textInput.Value(), 10, 16)
-				if err == nil && i > 1 {
+				if err == nil && i > 0 {
 					m.textInput.SetValue(fmt.Sprint(i - 1))
 				}
 			}
 
 		case "enter", " ":
-			if (m.cursor == 0 || m.cursor == 1 || m.cursor == 2) && !m.textInput.Focused() {
-				// Select Text input
+			if isTextInputSetting(m.cursor) && !m.textInput.Focused() {
 				m.textInput.Validate = textInputValidatorGen(m.cursor)
 				m.textInput.Focus()
 				m.textInput.SetValue(configValueFromIndex(m.cursor))
-			} else if m.cursor == 3 && m.sceneCursor < 0 {
-				// Select Scenes menu
-				m.sceneCursor = 0
-				tempScenes = configData.Scenes[:]
-			} else if m.cursor == 3 && m.sceneCursor == 0 {
-				loadLedfxScenes()
+			} else if isSubMenuSetting(m.cursor) && m.subCursor < 0 {
+				m.subCursor = 0
+				if m.cursor == settScenes {
+					tempScenes = configData.Scenes[:]
+				} else {
+					tempPlaylists = configData.Playlists[:]
+				}
+			} else if isSubMenuSetting(m.cursor) && m.subCursor == 0 {
+				if m.cursor == settScenes {
+					loadLedfxScenes()
+				} else {
+					loadLedfxPlaylists()
+				}
 			} else if msg.String() == "enter" && m.textInput.Focused() && m.textInput.Err == nil {
-				// set Text input changes
 				value := m.textInput.Value()
 				switch m.cursor {
-				case 0:
+				case settUniverse:
 					i, err := strconv.ParseUint(value, 10, 16)
 					if err == nil {
 						if configData.Universe != i {
@@ -359,15 +717,39 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 						configData.Universe = i
 					}
-				case 1:
+				case settSceneCh:
 					i, err := strconv.ParseUint(value, 10, 16)
 					if err == nil {
-						if configData.Channel != i {
+						if configData.Channels.Scene != i {
 							m.changed = true
 						}
-						configData.Channel = i
+						configData.Channels.Scene = i
 					}
-				case 2:
+				case settPlaylistCh:
+					i, err := strconv.ParseUint(value, 10, 16)
+					if err == nil {
+						if configData.Channels.Playlist != i {
+							m.changed = true
+						}
+						configData.Channels.Playlist = i
+					}
+				case settBrightnessCh:
+					i, err := strconv.ParseUint(value, 10, 16)
+					if err == nil {
+						if configData.Channels.Brightness != i {
+							m.changed = true
+						}
+						configData.Channels.Brightness = i
+					}
+				case settBlackoutCh:
+					i, err := strconv.ParseUint(value, 10, 16)
+					if err == nil {
+						if configData.Channels.Blackout != i {
+							m.changed = true
+						}
+						configData.Channels.Blackout = i
+					}
+				case settHost:
 					if configData.LedFx_host != value {
 						m.changed = true
 					}
@@ -375,8 +757,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 
 				m.textInput.Blur()
-			} else if m.cursor == 4 && m.changed {
-				//Save config.json
+			} else if m.cursor == settSave && m.changed {
 				out, err := json.MarshalIndent(configData, "", "  ")
 				if err != nil {
 					log.Fatal(err)
@@ -391,32 +772,38 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				configFromFile = true
 			}
 		case "pgup":
-			if m.cursor == 3 && m.sceneCursor > 1 {
-				tempScenes[m.sceneCursor-2], tempScenes[m.sceneCursor-1] =
-					tempScenes[m.sceneCursor-1], tempScenes[m.sceneCursor-2]
-				m.sceneCursor--
+			if isSubMenuSetting(m.cursor) && m.subCursor > 1 {
+				list := activeSubList(m.cursor)
+				list[m.subCursor-2], list[m.subCursor-1] =
+					list[m.subCursor-1], list[m.subCursor-2]
+				m.subCursor--
 			}
 		case "pgdown":
-			if m.cursor == 3 && m.sceneCursor > 0 && m.sceneCursor < len(tempScenes) {
-				tempScenes[m.sceneCursor-1], tempScenes[m.sceneCursor-0] =
-					tempScenes[m.sceneCursor-0], tempScenes[m.sceneCursor-1]
-				m.sceneCursor++
+			if isSubMenuSetting(m.cursor) && m.subCursor > 0 && m.subCursor < len(activeSubList(m.cursor)) {
+				list := activeSubList(m.cursor)
+				list[m.subCursor-1], list[m.subCursor-0] =
+					list[m.subCursor-0], list[m.subCursor-1]
+				m.subCursor++
 			}
 		case "ctrl+s":
-			if m.cursor == 3 && m.sceneCursor >= 0 {
-				configData.Scenes = tempScenes
-				m.sceneCursor = -1
+			if isSubMenuSetting(m.cursor) && m.subCursor >= 0 {
+				if m.cursor == settScenes {
+					configData.Scenes = tempScenes
+				} else {
+					configData.Playlists = tempPlaylists
+				}
+				m.subCursor = -1
 				m.changed = true
 			}
 		case "esc":
 			m.textInput.Blur()
-			m.sceneCursor = -1
+			m.subCursor = -1
 
 		case "tab":
 			m.textInput.Reset()
 		}
 
-	case updateSceneMsg:
+	case updateStatusMsg:
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
@@ -454,14 +841,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func configValueFromIndex(index int) string {
 	switch index {
-	case 0:
+	case settUniverse:
 		return fmt.Sprintf("%d", configData.Universe)
-	case 1:
-		return fmt.Sprintf("%d", configData.Channel)
-	case 2:
+	case settSceneCh:
+		return fmt.Sprintf("%d", configData.Channels.Scene)
+	case settPlaylistCh:
+		return fmt.Sprintf("%d", configData.Channels.Playlist)
+	case settBrightnessCh:
+		return fmt.Sprintf("%d", configData.Channels.Brightness)
+	case settBlackoutCh:
+		return fmt.Sprintf("%d", configData.Channels.Blackout)
+	case settHost:
 		return configData.LedFx_host
-	case 3:
+	case settScenes:
 		return fmt.Sprintf("%d Scenes", len(configData.Scenes))
+	case settPlaylists:
+		return fmt.Sprintf("%d Playlists", len(configData.Playlists))
 	default:
 		return ""
 	}
@@ -485,7 +880,13 @@ func (m model) View() string {
 				title,
 			))
 
-	sceneInfo := fmt.Sprintf(" %03d => %s", channelValue, ActiveScene)
+	// Status line
+	blackoutStr := "OFF"
+	if BlackoutActive {
+		blackoutStr = "ON"
+	}
+	sceneInfo := fmt.Sprintf(" Scene: %s | Playlist: %s | Bri: %d%% | Blackout: %s",
+		ActiveScene, ActivePlaylist, int(currentBrightness*100), blackoutStr)
 
 	recievingSpinner := m.spinner.View()
 
@@ -500,7 +901,7 @@ func (m model) View() string {
 
 	settingsColumn := ""
 	valueColumn := ""
-	sceneColumn := ""
+	subMenuColumn := ""
 
 	for i, setting := range m.settingItems {
 		cursor := " " // no cursor
@@ -509,7 +910,7 @@ func (m model) View() string {
 		if m.cursor == i {
 			lineStyle = colStyle(m.styles.colorSelected)
 			if !m.textInput.Focused() {
-				if m.sceneCursor < 0 {
+				if m.subCursor < 0 {
 					cursor = ">" // cursor!
 				}
 			} else {
@@ -521,42 +922,59 @@ func (m model) View() string {
 		valueColumn += value + "\n"
 	}
 
-	lineStyle := colStyle(m.styles.colorText)
-	if m.sceneCursor == 0 {
-		sceneColumn += ">"
-		lineStyle = colStyle(m.styles.colorSelected)
-	} else {
-		sceneColumn += " "
-	}
-	sceneColumn += " [get scenes from LedFx Api]"
-	sceneColumn = lineStyle.Render(sceneColumn) + "\n"
-
-	for i, ts := range tempScenes {
-		cursor := " " // no cursor
-		lineStyle := colStyle(m.styles.colorText)
-		if m.sceneCursor-1 == i {
-			cursor = ">" // cursor!
-			lineStyle = colStyle(m.styles.colorSelected)
+	// Build submenu column for scenes or playlists
+	if m.subCursor >= 0 && isSubMenuSetting(m.cursor) {
+		var subList []string
+		var subLabel string
+		if m.cursor == settScenes {
+			subList = tempScenes
+			subLabel = "[get scenes from LedFx Api]"
+		} else {
+			subList = tempPlaylists
+			subLabel = "[get playlists from LedFx Api]"
 		}
-		sceneColumn += lineStyle.Render(fmt.Sprintf("%s %d. %s", cursor, i+1, ts)) + "\n"
+
+		lineStyle := colStyle(m.styles.colorText)
+		if m.subCursor == 0 {
+			subMenuColumn += ">"
+			lineStyle = colStyle(m.styles.colorSelected)
+		} else {
+			subMenuColumn += " "
+		}
+		subMenuColumn = lineStyle.Render(subMenuColumn+" "+subLabel) + "\n"
+
+		for i, item := range subList {
+			cursor := " "
+			lineStyle := colStyle(m.styles.colorText)
+			if m.subCursor-1 == i {
+				cursor = ">"
+				lineStyle = colStyle(m.styles.colorSelected)
+			}
+			subMenuColumn += lineStyle.Render(fmt.Sprintf("%s %d. %s", cursor, i+1, item)) + "\n"
+		}
 	}
 
 	pad := lipgloss.NewStyle().PaddingLeft(2).PaddingRight(2)
 
 	settingsBlock := settingsHeader + "\n\n"
-	if m.sceneCursor < 0 {
+	if m.subCursor < 0 || !isSubMenuSetting(m.cursor) {
 		settingsBlock += lipgloss.JoinHorizontal(lipgloss.Top, pad.Render(settingsColumn), valueColumn)
 	} else {
-		settingsBlock += lipgloss.JoinHorizontal(lipgloss.Top, pad.Render(settingsColumn), sceneColumn)
+		settingsBlock += lipgloss.JoinHorizontal(lipgloss.Top, pad.Render(settingsColumn), subMenuColumn)
 	}
 
 	// The footer
-	footer := " Press q to quit."
+	footer := " Press q to quit, e to export QLC+ fixture."
 	if m.textInput.Focused() {
 		footer = " Press esc to abort edit or enter to submit."
-	}
-	if m.sceneCursor >= 0 {
-		footer = " Press esc to abort, PgUp or PgDn to reorder scenes or ctrl+S to Save"
+	} else if m.subCursor >= 0 {
+		footer = " Press esc to abort, PgUp or PgDn to reorder or ctrl+S to Save"
+	} else if m.exportMsg != "" {
+		connStatus := "Waiting for sACN…"
+		if m.recieving {
+			connStatus = "Connected ✓"
+		}
+		footer = fmt.Sprintf(" %s | %s", m.exportMsg, connStatus)
 	}
 
 	// Send the UI for rendering

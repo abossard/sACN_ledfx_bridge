@@ -1,7 +1,21 @@
 {
   "sAcnUniverse": 1,
-  "channel": 1,
+  "channels": {
+    "scene": 1,
+    "playlist": 2,
+    "brightness": 3,
+    "blackout": 4
+  },
   "scenes": [
+    "beat-reactor",
+    "calm-ocean-scene-with-slow-blue-waves",
+    "calm-ocean-scene-with-slow-blue-waves-1",
+    "cyberpunk-pulse",
+    "lava-flow",
+    "northern-lights",
+    "peter",
+    "sunset-scroll"
   ],
+  "playlists": [],
   "ledfx_host": "http://127.0.0.1:8888"
 }

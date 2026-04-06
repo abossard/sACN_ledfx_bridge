@@ -1,21 +1,33 @@
 {
-  "sAcnUniverse": 1,
+  "sAcnUniverse": 2,
   "channels": {
     "scene": 1,
     "playlist": 2,
     "brightness": 3,
-    "blackout": 4
+    "blackout": 4,
+    "color": 5
   },
   "scenes": [
     "beat-reactor",
     "calm-ocean-scene-with-slow-blue-waves",
     "calm-ocean-scene-with-slow-blue-waves-1",
     "cyberpunk-pulse",
+    "deep-ocean",
+    "equalizer-party",
     "lava-flow",
     "northern-lights",
     "peter",
+    "random-flash-chaos",
     "sunset-scroll"
   ],
-  "playlists": [],
+  "playlists": [
+    "all-the-things",
+    "ambient-mood",
+    "chaos-mode",
+    "chill-vibes",
+    "music-reactive",
+    "party-mix"
+  ],
+  "colors": [],
   "ledfx_host": "http://127.0.0.1:8888"
 }

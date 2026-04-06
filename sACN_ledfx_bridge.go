@@ -38,9 +38,11 @@ const (
 	settPlaylistCh
 	settBrightnessCh
 	settBlackoutCh
+	settColorCh
 	settHost
 	settScenes
 	settPlaylists
+	settColors
 	settSave
 )
 
@@ -49,15 +51,18 @@ type Channels struct {
 	Playlist   uint64 `json:"playlist"`
 	Brightness uint64 `json:"brightness"`
 	Blackout   uint64 `json:"blackout"`
+	Color      uint64 `json:"color"`
 }
 
 type Config struct {
-	Universe   uint64   `json:"sAcnUniverse"`
-	Channel    uint64   `json:"channel,omitempty"` // legacy, migrated to Channels.Scene
-	Channels   Channels `json:"channels"`
-	Scenes     []string `json:"scenes"`
-	Playlists  []string `json:"playlists"`
-	LedFx_host string   `json:"ledfx_host"`
+	Universe   uint64            `json:"sAcnUniverse"`
+	Channel    uint64            `json:"channel,omitempty"` // legacy, migrated to Channels.Scene
+	Channels   Channels          `json:"channels"`
+	Scenes     []string          `json:"scenes"`
+	Playlists  []string          `json:"playlists"`
+	Colors     []string          `json:"colors"`
+	ColorHex   map[string]string `json:"colorHex,omitempty"`
+	LedFx_host string            `json:"ledfx_host"`
 }
 
 func ledfxRequest(method, path string, body interface{}) error {
@@ -145,8 +150,36 @@ func setGlobalBrightness(value float64) {
 	}
 }
 
+func forceColor(colorName string) {
+	ActiveColor = prettifyName(colorName)
+	p.Send(updateStatusMsg{})
+
+	err := ledfxRequest(http.MethodPut, "/api/virtuals_tools", map[string]interface{}{
+		"tool": "force_color", "color": colorName,
+	})
+	if err != nil {
+		log.Printf("forceColor error: %v", err)
+	}
+}
+
+func clearForceColor() {
+	ActiveColor = "OFF"
+	p.Send(updateStatusMsg{})
+
+	if ActiveScene != "OFF" {
+		_ = ledfxRequest(http.MethodPut, "/api/scenes", map[string]interface{}{
+			"id": ActiveScene, "action": "activate",
+		})
+	} else {
+		_ = ledfxRequest(http.MethodPut, "/api/virtuals_tools", map[string]interface{}{
+			"tool": "force_color", "color": "black",
+		})
+	}
+}
+
 var ActiveScene = "OFF"
 var ActivePlaylist = "OFF"
+var ActiveColor = "OFF"
 var BlackoutActive = false
 var currentBrightness float64 = 1.0
 
@@ -158,6 +191,8 @@ var brightnessChVal byte = 0
 var lastBrightnessChVal byte = 0
 var blackoutChVal byte = 0
 var lastBlackoutChVal byte = 0
+var colorChVal byte = 0
+var lastColorChVal byte = 0
 
 var brightnessTimer *time.Timer
 
@@ -170,13 +205,17 @@ var configData Config = Config{
 		Playlist:   2,
 		Brightness: 3,
 		Blackout:   4,
+		Color:      5,
 	},
 	Scenes:     []string{},
 	Playlists:  []string{},
+	Colors:     []string{},
+	ColorHex:   map[string]string{},
 	LedFx_host: "http://127.0.0.1:8888",
 }
 var tempScenes = []string{}
 var tempPlaylists = []string{}
+var tempColors = []string{}
 
 var configFile string
 
@@ -298,6 +337,21 @@ func main() {
 				}
 			}
 		}
+
+		// Color override channel
+		if configData.Channels.Color > 0 {
+			colorChVal = data[configData.Channels.Color-1]
+			if colorChVal != lastColorChVal {
+				lastColorChVal = colorChVal
+				if colorChVal == 0 {
+					if ActiveColor != "OFF" {
+						clearForceColor()
+					}
+				} else if int(colorChVal) <= len(configData.Colors) {
+					forceColor(configData.Colors[colorChVal-1])
+				}
+			}
+		}
 	})
 	recv.SetTimeoutCallback(func(univ uint16) {
 		if univ == uint16(configData.Universe) {
@@ -381,6 +435,51 @@ func loadLedfxPlaylists() {
 	slices.Sort(tempPlaylists)
 }
 
+func loadLedfxColors() {
+	resp, err := http.Get(
+		configData.LedFx_host + "/api/colors",
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var apiObj struct {
+		Colors struct {
+			Builtin map[string]string `json:"builtin"`
+			User    map[string]string `json:"user"`
+		} `json:"colors"`
+	}
+
+	err = json.Unmarshal(body, &apiObj)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	tempColors = tempColors[:0]
+	if configData.ColorHex == nil {
+		configData.ColorHex = map[string]string{}
+	}
+
+	for name, hex := range apiObj.Colors.Builtin {
+		if name != "black" { // skip black, it's used as "OFF"
+			tempColors = append(tempColors, name)
+			configData.ColorHex[name] = hex
+		}
+	}
+	for name, hex := range apiObj.Colors.User {
+		tempColors = append(tempColors, name)
+		configData.ColorHex[name] = hex
+	}
+
+	slices.Sort(tempColors)
+}
+
 func prettifyName(slug string) string {
 	parts := strings.Split(slug, "-")
 	for i, p := range parts {
@@ -460,12 +559,33 @@ func generateQXF() string {
  </Channel>
 `)
 
+	// Color Override channel with ColorMacro presets for color swatches
+	b.WriteString(" <Channel Name=\"Color Override\">\n")
+	b.WriteString("  <Group Byte=\"0\">Colour</Group>\n")
+	b.WriteString("  <Capability Min=\"0\" Max=\"0\">Color OFF</Capability>\n")
+	for i, color := range configData.Colors {
+		name := html.EscapeString(prettifyName(color))
+		hex := configData.ColorHex[color]
+		if hex != "" {
+			b.WriteString(fmt.Sprintf("  <Capability Min=\"%d\" Max=\"%d\" Preset=\"ColorMacro\" Res1=\"%s\">%s</Capability>\n",
+				i+1, i+1, hex, name))
+		} else {
+			b.WriteString(fmt.Sprintf("  <Capability Min=\"%d\" Max=\"%d\">%s</Capability>\n",
+				i+1, i+1, name))
+		}
+	}
+	if len(configData.Colors) < 255 {
+		b.WriteString(fmt.Sprintf("  <Capability Min=\"%d\" Max=\"255\">No function</Capability>\n", len(configData.Colors)+1))
+	}
+	b.WriteString(" </Channel>\n")
+
 	// Mode
-	b.WriteString(" <Mode Name=\"4 Channel\">\n")
+	b.WriteString(" <Mode Name=\"5 Channel\">\n")
 	b.WriteString("  <Channel Number=\"0\">Scene Select</Channel>\n")
 	b.WriteString("  <Channel Number=\"1\">Playlist Select</Channel>\n")
 	b.WriteString("  <Channel Number=\"2\">Brightness</Channel>\n")
 	b.WriteString("  <Channel Number=\"3\">Blackout</Channel>\n")
+	b.WriteString("  <Channel Number=\"4\">Color Override</Channel>\n")
 	b.WriteString(" </Mode>\n")
 
 	// Physical
@@ -566,7 +686,7 @@ func textInputValidatorGen(cursorPos int) textinput.ValidateFunc {
 			}
 			return nil
 		})
-	} else if cursorPos >= settSceneCh && cursorPos <= settBlackoutCh {
+	} else if cursorPos >= settSceneCh && cursorPos <= settColorCh {
 		return textinput.ValidateFunc(func(str string) error {
 			i, err := strconv.ParseUint(str, 10, 16)
 			if err != nil {
@@ -601,8 +721,8 @@ func initialModel() model {
 		styles: DefaultStyles(),
 		settingItems: []string{
 			"Universe", "Scene Channel", "Playlist Channel",
-			"Brightness Channel", "Blackout Channel",
-			"LedFx Host", "Scenes", "Playlists", "[Save]",
+			"Brightness Channel", "Blackout Channel", "Color Channel",
+			"LedFx Host", "Scenes", "Playlists", "Colors", "[Save]",
 		},
 		textInput: ti,
 		spinner:   sp,
@@ -630,14 +750,20 @@ func isTextInputSetting(cursor int) bool {
 }
 
 func isSubMenuSetting(cursor int) bool {
-	return cursor == settScenes || cursor == settPlaylists
+	return cursor == settScenes || cursor == settPlaylists || cursor == settColors
 }
 
 func activeSubList(cursor int) []string {
-	if cursor == settScenes {
+	switch cursor {
+	case settScenes:
 		return tempScenes
+	case settPlaylists:
+		return tempPlaylists
+	case settColors:
+		return tempColors
+	default:
+		return nil
 	}
-	return tempPlaylists
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -697,14 +823,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.subCursor = 0
 				if m.cursor == settScenes {
 					tempScenes = configData.Scenes[:]
-				} else {
+				} else if m.cursor == settPlaylists {
 					tempPlaylists = configData.Playlists[:]
+				} else {
+					tempColors = configData.Colors[:]
 				}
 			} else if isSubMenuSetting(m.cursor) && m.subCursor == 0 {
 				if m.cursor == settScenes {
 					loadLedfxScenes()
-				} else {
+				} else if m.cursor == settPlaylists {
 					loadLedfxPlaylists()
+				} else {
+					loadLedfxColors()
 				}
 			} else if msg.String() == "enter" && m.textInput.Focused() && m.textInput.Err == nil {
 				value := m.textInput.Value()
@@ -749,6 +879,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 						configData.Channels.Blackout = i
 					}
+				case settColorCh:
+					i, err := strconv.ParseUint(value, 10, 16)
+					if err == nil {
+						if configData.Channels.Color != i {
+							m.changed = true
+						}
+						configData.Channels.Color = i
+					}
 				case settHost:
 					if configData.LedFx_host != value {
 						m.changed = true
@@ -789,8 +927,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if isSubMenuSetting(m.cursor) && m.subCursor >= 0 {
 				if m.cursor == settScenes {
 					configData.Scenes = tempScenes
-				} else {
+				} else if m.cursor == settPlaylists {
 					configData.Playlists = tempPlaylists
+				} else {
+					configData.Colors = tempColors
 				}
 				m.subCursor = -1
 				m.changed = true
@@ -851,12 +991,16 @@ func configValueFromIndex(index int) string {
 		return fmt.Sprintf("%d", configData.Channels.Brightness)
 	case settBlackoutCh:
 		return fmt.Sprintf("%d", configData.Channels.Blackout)
+	case settColorCh:
+		return fmt.Sprintf("%d", configData.Channels.Color)
 	case settHost:
 		return configData.LedFx_host
 	case settScenes:
 		return fmt.Sprintf("%d Scenes", len(configData.Scenes))
 	case settPlaylists:
 		return fmt.Sprintf("%d Playlists", len(configData.Playlists))
+	case settColors:
+		return fmt.Sprintf("%d Colors", len(configData.Colors))
 	default:
 		return ""
 	}
@@ -885,8 +1029,8 @@ func (m model) View() string {
 	if BlackoutActive {
 		blackoutStr = "ON"
 	}
-	sceneInfo := fmt.Sprintf(" Scene: %s | Playlist: %s | Bri: %d%% | Blackout: %s",
-		ActiveScene, ActivePlaylist, int(currentBrightness*100), blackoutStr)
+	sceneInfo := fmt.Sprintf(" Scene: %s | Playlist: %s | Bri: %d%% | Blackout: %s | Color: %s",
+		ActiveScene, ActivePlaylist, int(currentBrightness*100), blackoutStr, ActiveColor)
 
 	recievingSpinner := m.spinner.View()
 
@@ -929,9 +1073,12 @@ func (m model) View() string {
 		if m.cursor == settScenes {
 			subList = tempScenes
 			subLabel = "[get scenes from LedFx Api]"
-		} else {
+		} else if m.cursor == settPlaylists {
 			subList = tempPlaylists
 			subLabel = "[get playlists from LedFx Api]"
+		} else {
+			subList = tempColors
+			subLabel = "[get colors from LedFx Api]"
 		}
 
 		lineStyle := colStyle(m.styles.colorText)

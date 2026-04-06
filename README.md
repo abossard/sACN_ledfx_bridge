@@ -11,9 +11,9 @@ The [original by 8-Lambda-8](https://github.com/8-Lambda-8/sACN_ledfx_bridge) ha
 ### New DMX channels
 - **Playlist control** — start/stop LedFx playlists via DMX (mutually exclusive with scenes)
 - **Effect type override** — switch the effect running on all [virtuals](https://docs.ledfx.app/en/latest/howto/virtuals.html) via DMX, bypassing scenes/playlists
-- **Effect speed / sensitivity** — fader controlling audio reactivity via [`apply_global`](https://docs.ledfx.app/en/v2.1.2/apis/global.html)
-- **Transition speed** — fader controlling effect blend timing via `apply_global transition_time`
-- **Color / Gradient palette** — merged channel: preset colors use [`force_color`](https://docs.ledfx.app/en/latest/apis/api.html), gradients use `apply_global gradient_name`
+- **Effect speed / sensitivity** — per-virtual config update controlling audio reactivity
+- **Transition speed** — per-virtual config update controlling effect blend timing
+- **Color / Gradient palette** — merged channel: preset colors use [`force_color`](https://docs.ledfx.app/en/latest/apis/api.html), gradients use [`apply_global gradient`](https://docs.ledfx.app/en/v2.1.2/apis/global.html)
 - **RGB color override** — 3-channel RGB mixer sending arbitrary hex to `force_color` (QLC+ auto-shows a color picker!)
 - **Brightness control** — global brightness via [`PUT /api/config`](https://docs.ledfx.app/en/latest/apis/api.html)
 - **Brightness duck (sidechain)** — multiplier fader for moving-head interaction (beam fires → LEDs dim, beam off → LEDs restore)
@@ -23,11 +23,15 @@ The [original by 8-Lambda-8](https://github.com/8-Lambda-8/sACN_ledfx_bridge) ha
 
 ### New features
 - **14-channel QLC+ fixture generator** — export a self-documenting `.qxf` fixture definition from the TUI (press `e`), with `ColorMacro` swatches, `IntensityRed/Green/Blue` presets, and descriptive capabilities
+- **One-key refresh** — press `r` in the TUI to load all scenes, playlists, effects, colors, and gradients from LedFx and save the config in one shot
+- **Fixed 14-channel layout** — channel assignments are hardcoded and match the generated QXF fixture; no manual channel configuration needed
 - **Full busking support** — effect type + gradient + speed + RGB gives complete improvised control without pre-built scenes
+- **Non-blocking API calls** — each LedFx endpoint has its own worker goroutine with "latest value wins" coalescing; the sACN callback never blocks
+- **First-frame sync** — on the first DMX packet, all channels are pushed to LedFx regardless of value (ensures LedFx state matches DMX on startup)
 - **Immediate forwarding** — every new DMX value is forwarded instantly; duplicate values are silently ignored
-- **Centralized HTTP helper** — `ledfxRequest()` replaces scattered `http.Client` calls
+- **Modular architecture** — separated into `bridge/`, `coalesce/`, `ledfx/`, and `tui/` packages with dependency injection and table-driven tests
+- **Debug logging** — set `Debug: true` on the HTTP client to log all API calls with `→/✓/✗` indicators
 - **Non-fatal error handling** — `log.Printf` instead of `log.Fatal` on API errors
-- **TUI submenus for effects, gradients, and colors** — load available options directly from LedFx API
 
 ### LedFx API endpoints used
 
@@ -36,13 +40,15 @@ The [original by 8-Lambda-8](https://github.com/8-Lambda-8/sACN_ledfx_bridge) ha
 | [`/api/scenes`](https://docs.ledfx.app/en/latest/apis/scenes.html) | PUT | Activate/deactivate scenes |
 | [`/api/playlists`](https://docs.ledfx.app/en/latest/apis/api.html) | PUT | Start/stop playlists |
 | [`/api/config`](https://docs.ledfx.app/en/latest/apis/api.html) | PUT | Set global brightness |
-| [`/api/effects`](https://docs.ledfx.app/en/v2.1.2/apis/global.html) | PUT | `apply_global` for sensitivity, gradient, transition |
-| [`/api/virtuals/{id}/effects`](https://docs.ledfx.app/en/latest/apis/api.html) | PUT | Set effect type per virtual |
-| [`/api/virtuals_tools`](https://docs.ledfx.app/en/latest/apis/api.html) | PUT | `force_color` for solid colors and RGB |
-| `/api/schema/effects` | GET | Load available effect types |
-| `/api/gradients` | GET | Load available gradient presets |
+| [`/api/effects`](https://docs.ledfx.app/en/v2.1.2/apis/global.html) | PUT | `apply_global` for gradient, brightness, flip, mirror |
+| [`/api/virtuals/{id}/effects`](https://docs.ledfx.app/en/latest/apis/api.html) | PUT | Set effect type or update config (sensitivity, transition_time) per virtual |
+| [`/api/virtuals_tools`](https://docs.ledfx.app/en/latest/apis/api.html) | PUT | `force_color` for solid colors, RGB hex, and strobe |
+| [`/api/schema`](https://docs.ledfx.app/en/latest/apis/api.html) | GET | Load available effect types (from `effects` key) |
+| [`/api/config`](https://docs.ledfx.app/en/latest/apis/api.html) | GET | Load user gradients (from `user_gradients` key) |
 | [`/api/colors`](https://docs.ledfx.app/en/latest/apis/api.html) | GET | Load available color names + hex values |
-| `/api/virtuals` | GET | Cache virtual IDs for effect switching |
+| [`/api/virtuals`](https://docs.ledfx.app/en/latest/apis/api.html) | GET | Cache virtual IDs for effect/sensitivity updates |
+| [`/api/scenes`](https://docs.ledfx.app/en/latest/apis/scenes.html) | GET | Load scene list |
+| [`/api/playlists`](https://docs.ledfx.app/en/latest/apis/api.html) | GET | Load playlist list |
 
 
 ## Rewritten in GO
@@ -65,34 +71,34 @@ for old nodejs version go to [nodejs branch](https://github.com/8-Lambda-8/sACN_
 
 ## DMX Channel Layout
 
-Channels are sorted by priority — higher channels override lower ones. Set any channel to `0` to disable.
+The 14-channel layout is fixed and matches the generated QLC+ fixture definition. Channels are sorted by priority — higher channels override lower ones.
 
-| Config Key   | Default Ch | DMX Value | Action                                          |
-|--------------|------------|-----------|--------------------------------------------------|
-| `scene`      | 1          | 0         | Deactivate current scene                         |
-|              |            | 1–N       | Activate scene N (stops active playlist)          |
-| `playlist`   | 2          | 0         | Stop current playlist                            |
-|              |            | 1–N       | Start playlist N (deactivates active scene)       |
-| `effect`     | 3          | 0         | No override (use current scene/playlist effect)   |
-|              |            | 1–N       | Set effect type N on all virtuals                 |
-| `transition` | 4          | 0–255     | Transition speed (0 = instant, 255 = 5s blend)    |
-| `speed`      | 5          | 0         | Freeze (sensitivity = 0)                          |
-|              |            | 1–255     | Audio sensitivity (1 = subtle, 255 = intense)     |
-| `palette`    | 6          | 0         | No override (use scene defaults)                  |
-|              |            | 1–N       | Force color N (solid color on all virtuals)        |
-|              |            | N+1–N+M   | Apply gradient M (palette change on effects)       |
-| `red`        | 7          | 0–255     | Red component for RGB color override              |
-| `green`      | 8          | 0–255     | Green component for RGB color override             |
-| `blue`       | 9          | 0–255     | Blue component for RGB color override              |
-| `brightness` | 10         | 0–255     | Set base brightness (value / 255)                 |
-| `duck`       | 11         | 0         | No ducking (full brightness)                      |
-|              |            | 1–255     | Duck brightness (255 = fully dark, for beam cues)  |
-| `freeze`     | 12         | 0–127     | Normal (effects react to audio)                   |
-|              |            | 128–255   | Freeze (hold current visual, ignore audio)         |
-| `strobe`     | 13         | 0–127     | Normal (no flash)                                 |
-|              |            | 128–255   | Flash (force all LEDs white)                      |
-| `blackout`   | 14         | 0–127     | Normal operation                                  |
-|              |            | 128–255   | Blackout (force brightness to 0, overrides all)    |
+| Ch | Name | DMX Value | Action |
+|----|------|-----------|--------|
+| 1 | Scene Select | 0 | Deactivate current scene |
+| | | 1–N | Activate scene N (stops active playlist) |
+| 2 | Playlist Select | 0 | Stop current playlist |
+| | | 1–N | Start playlist N (deactivates active scene) |
+| 3 | Effect Type | 0 | No override (use current scene/playlist effect) |
+| | | 1–N | Set effect type N on all virtuals |
+| 4 | Transition Speed | 0–255 | Transition speed (0 = instant, 255 = 5s blend) |
+| 5 | Effect Speed | 0 | Freeze (sensitivity = 0) |
+| | | 1–255 | Audio sensitivity (1 = subtle, 255 = intense) |
+| 6 | Color / Gradient | 0 | No override (use scene defaults) |
+| | | 1–N | Force color N (solid color on all virtuals) |
+| | | N+1–N+M | Apply gradient M (palette change on effects) |
+| 7 | Red | 0–255 | Red component for RGB color override |
+| 8 | Green | 0–255 | Green component for RGB color override |
+| 9 | Blue | 0–255 | Blue component for RGB color override |
+| 10 | Brightness | 0–255 | Set base brightness (value / 255) |
+| 11 | Duck (Sidechain) | 0 | No ducking (full brightness) |
+| | | 1–255 | Duck brightness (255 = fully dark, for beam cues) |
+| 12 | Freeze / Hold | 0–127 | Normal (effects react to audio) |
+| | | 128–255 | Freeze (hold current visual, ignore audio) |
+| 13 | Strobe / Flash | 0–127 | Normal (no flash) |
+| | | 128–255 | Flash (force all LEDs white) |
+| 14 | Blackout | 0–127 | Normal operation |
+| | | 128–255 | Blackout (force brightness to 0, overrides all) |
 
 **Priority rules:**
 - Blackout (ch 14) overrides everything
@@ -103,7 +109,6 @@ Channels are sorted by priority — higher channels override lower ones. Set any
 - Scene and playlist are mutually exclusive
 - Effect type override bypasses scene/playlist effects
 - All faders forward every new value immediately; duplicates are ignored
-- To disable any channel entirely, set it to `0` in the config
 
 ### Off states (DMX value 0)
 
@@ -117,59 +122,37 @@ Channels are sorted by priority — higher channels override lower ones. Set any
 | **Brightness** | **Dark (0%) — standard DMX dimmer, always active** |
 | Freeze, Strobe, Blackout | 0–127 = normal operation |
 
-> **Note:** Brightness at 0 means LEDs are dark — this is standard DMX dimmer behavior. To stop controlling brightness entirely, set `channels.brightness: 0` in config.
+> **Note:** Brightness at 0 means LEDs are dark — this is standard DMX dimmer behavior.
 
 ## Configuration
 
 ```json
 {
   "sAcnUniverse": 1,
-  "channels": {
-    "scene": 1,
-    "playlist": 2,
-    "effect": 3,
-    "transition": 4,
-    "speed": 5,
-    "palette": 6,
-    "red": 7,
-    "green": 8,
-    "blue": 9,
-    "brightness": 10,
-    "duck": 11,
-    "freeze": 12,
-    "strobe": 13,
-    "blackout": 14
-  },
   "scenes": ["beat-reactor", "cyberpunk-pulse", "..."],
   "playlists": ["ambient-mood", "party-mix", "..."],
-  "effects": ["energy(Reactive)", "bars(Reactive)", "..."],
-  "gradients": ["Rainbow", "Ocean", "..."],
+  "effects": ["energy", "bars", "spectrum", "..."],
+  "gradients": ["palette:cyberpunk", "palette:lava", "..."],
   "colors": ["red", "blue", "green", "..."],
   "ledfx_host": "http://127.0.0.1:8888"
 }
 ```
 
-Scene, playlist, effect, gradient, and color IDs can be loaded directly from the LedFx API via the TUI submenus.
+Channel assignments are hardcoded (1–14) and match the generated QXF fixture — no manual configuration needed.
+
+Press **`r`** in the TUI to load all scenes, playlists, effects, colors, and gradients from LedFx and save the config in one shot.
 
 ## New TUI
 
 ![alt text](screenshot.png)
 
-### Example configuration for QLC+:
-- QLC+, LedFx and sACN_ledfx_bridge running on same machine
-- QLC:
-  - 127.0.0.1 network
-  - Multicast: off
-  - Port: 5568 (Default)
-  - E1.31 Universe 1 (Default)
-  - Transmission Mode: Full (Default)
-  - Priority: 100 (Default)
-- Bridge:
-  - Universe: 1 (Default)
-  - Channels 1–14 (all defaults): Scene, Playlist, Effect, Transition, Speed, Palette, R, G, B, Brightness, Duck, Freeze, Strobe, Blackout
-  - LedFx Host: http://127.0.0.1:8888 (Default)
-  - Use TUI submenus to load scenes, playlists, effects, gradients, and colors from LedFx
-  - Press `e` to export the QLC+ fixture definition
+### Quick start with QLC+:
+1. Start LedFx, QLC+, and sACN_ledfx_bridge on the same machine
+2. In the bridge TUI, press **`r`** to load scenes/effects/colors from LedFx
+3. Press **`e`** to export the QLC+ fixture definition (auto-installs to QLC+ fixtures folder)
+4. Restart QLC+ → add the "LedFx sACN Bridge" fixture → patch to universe 1, channels 1–14
+5. QLC+ settings:
+   - 127.0.0.1 network, Multicast: off
+   - Port: 5568 (Default), E1.31 Universe 1
+   - Transmission Mode: Full, Priority: 100
 
-
-![image](https://github.com/user-attachments/assets/27a1b6d9-208f-4606-9000-ac30cd6a63e1)
